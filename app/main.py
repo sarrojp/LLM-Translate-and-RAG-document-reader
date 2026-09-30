@@ -19,7 +19,6 @@ client = OpenAI(
     model="gpt-4.1-mini"
 )
 
-
 # Initialize FastAPI client
 async def lifespan(app: FastAPI):
     yield
