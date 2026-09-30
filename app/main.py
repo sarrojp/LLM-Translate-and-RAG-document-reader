@@ -1,89 +1,115 @@
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import os
 
-from sqlmodel import select
-from contextlib import asynccontextmanager
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAI
+from langchain_openai.embeddings import OpenAIEmbeddings
 
-from app.db import get_session, init_db
-from app.models import Song, SongCreate
+# Load environment variables
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+# Initialize the LLM (using OpenAI)
+client = OpenAI(
+    api_key=openai_api_key,
+    model="gpt-4.1-mini"
+)
 
 
-#@asynccontextmanager
-#async def lifespan(app: FastAPI):
- #   await init_db()
-  #  yield
+# Initialize FastAPI client
+async def lifespan(app: FastAPI):
+    yield
 
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/songs", response_model=list[Song])
-async def get_songs(session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(Song))
-    songs = result.scalars().all()
-    return [Song(name=song.name, artist=song.artist, id=song.id) for song in songs]
+# Create class with pydantic BaseModel
+class TranslationRequest(BaseModel):
+    input_str: str
 
 
-@app.post("/songs")
-async def add_song(song: SongCreate, session: AsyncSession = Depends(get_session)):
-    song = Song(name=song.name, artist=song.artist)
-    session.add(song)
-    await session.commit()
-    await session.refresh(song)
-    return song
+# Function to set up the Translation system
+def translate_text(input_str):
+    prompt = f"""
+    You are an expert translator who translates text from English to French
+    and only return translated text.
+
+    Text:
+    {input_str}
+    """
+
+    return client.invoke(prompt)
 
 
+# Function to set up the RAG system
+def setup_rag_system():
+    
+    # Load the document
+    loader = TextLoader('app/data/my_document.txt')
+    documents = loader.load()
 
-@app.put("/songs/{song_id}", response_model=Song)
-async def update_song(
-    song_id: int,
-    updated_song: SongCreate,
-    session: AsyncSession = Depends(get_session)
-):
-    result = await session.execute(
-        select(Song).where(Song.id == song_id)
+    # Split the document into chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    document_chunks = splitter.split_documents(documents)
+
+    # Initialize embeddings with OpenAI API key
+    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+
+    # Create FAISS vector store from document chunks and embeddings
+    vector_store = FAISS.from_documents(document_chunks, embeddings)
+
+    # Return the retriever for document retrieval with specified search_type
+    retriever = vector_store.as_retriever(
+        search_type="similarity",  # or "mmr" or "similarity_score_threshold"
+        search_kwargs={"k": 5}  # Adjust the number of results if needed
     )
-
-    song = result.scalar_one_or_none()
-
-    if not song:
-        raise HTTPException(
-            status_code=404,
-            detail="Song not found"
-        )
-
-    song.name = updated_song.name
-    song.artist = updated_song.artist
-
-    session.add(song)
-
-    await session.commit()
-    await session.refresh(song)
-
-    return song
+    return retriever
 
 
-@app.delete("/songs/{song_id}")
-async def delete_song(
-    song_id: int,
-    session: AsyncSession = Depends(get_session)
-):
-    result = await session.execute(
-        select(Song).where(Song.id == song_id)
-    )
+# Function to get the response from the RAG system
+async def get_rag_response(query: str):
 
-    song = result.scalar_one_or_none()
+    retriever = setup_rag_system()
+    
+    # Retrieve the relevant documents using 'get_relevant_documents' method
+    retrieved_docs = retriever.get_relevant_documents(query)
 
-    if not song:
-        raise HTTPException(
-            status_code=404,
-            detail="Song not found"
-        )
+    # Prepare the input for the LLM: Combine the query and the retrieved documents into a single string
+    context = "\n".join([doc.page_content for doc in retrieved_docs])
 
-    await session.delete(song)
+    # LLM expects a list of strings (prompts), so we create one by combining the query with the retrieved context
+    prompt = [f"Use the following information to answer the question:\n\n{context}\n\nQuestion: {query}"]
 
-    await session.commit()
+    # Generate the final response using the language model (LLM)
+    generated_response = client.invoke(prompt[0])
+    
+    return generated_response
 
-    return {
-        "message": f"Song with id {song_id} deleted successfully"
-    }
+
+# SET UP ROUTING   
+
+# Route for translation
+@app.post("/translate", tags=["Translation"])
+async def translate(request: TranslationRequest):
+    try:
+        # Call your translation function
+        translated_text = translate_text(request.input_str)
+        return {"translated_text": translated_text}
+    except Exception as e:
+        # Handle exceptions or errors during translation
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Route for RAG system query
+@app.get("/query", tags=["RAG System"])
+async def query_rag_system(query: str):
+    try:
+        # Pass the query string to your RAG system and return the response
+        response = await get_rag_response(query)
+        return {"query": query, "response": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
